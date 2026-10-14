@@ -1,0 +1,5 @@
+pywin32>=306
+pystray>=0.19
+Pillow>=10
+pytest>=8
+pyinstaller>=6
