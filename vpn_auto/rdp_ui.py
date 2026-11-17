@@ -44,6 +44,8 @@ class RdpWindow:
         self.username = tk.StringVar()
         self.password = tk.StringVar()
         self.remember = tk.BooleanVar(value=True)
+        self.multi = tk.BooleanVar(value=False)
+        self.count = tk.StringVar(value="1")
 
         ttk.Label(frame, text="IP máy cần kết nối").grid(row=0, column=0, sticky="w", **pad)
         self.ip_box = ttk.Combobox(frame, textvariable=self.ip, width=28)
@@ -59,21 +61,33 @@ class RdpWindow:
         ttk.Label(frame, text="Mật khẩu").grid(row=2, column=0, sticky="w", **pad)
         self.pw_entry = ttk.Entry(frame, textvariable=self.password, show=MASK)
         self.pw_entry.grid(row=2, column=1, sticky="we", pady=6)
-        shown = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frame, text="Hiện", variable=shown,
-                        command=lambda: self.pw_entry.configure(show="" if shown.get() else MASK)
+        self.show_pw = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text="Hiện", variable=self.show_pw,
+                        command=lambda: self.pw_entry.configure(show="" if self.show_pw.get() else MASK)
                         ).grid(row=2, column=2, sticky="w", padx=(6, 0))
         self.pw_hint = ttk.Label(frame, text="", foreground="#777")
         self.pw_hint.grid(row=3, column=1, sticky="w")
 
         ttk.Checkbutton(frame, text="Nhớ máy này (mật khẩu mã hóa DPAPI)", variable=self.remember
                         ).grid(row=4, column=1, columnspan=2, sticky="w", pady=(0, 4))
+
+        # Multi remote: open several sessions to this machine. Saved per IP, never shared.
+        ttk.Checkbutton(frame, text="Multi remote", variable=self.multi, command=self._on_multi_toggle
+                        ).grid(row=5, column=0, sticky="w", padx=10, pady=(0, 4))
+        multi_row = ttk.Frame(frame)
+        multi_row.grid(row=5, column=1, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(multi_row, text="Số kết nối").pack(side="left")
+        self.count_box = ttk.Spinbox(multi_row, from_=1, to=rdp_store.MAX_SESSIONS, width=5,
+                                     textvariable=self.count, state="disabled")
+        self.count_box.pack(side="left", padx=(6, 0))
+        ttk.Label(multi_row, foreground="#777", text="(lưu riêng cho máy này)").pack(side="left", padx=(6, 0))
+
         ttk.Label(frame, foreground="#777", wraplength=360,
                   text="Để trống mật khẩu: tool thử lại tới khi vào được màn hình đăng nhập để bạn tự nhập. "
-                       "Có mật khẩu: tool tự điền và vào thẳng.").grid(row=5, column=0, columnspan=3, sticky="w")
+                       "Có mật khẩu: tool tự điền và vào thẳng.").grid(row=6, column=0, columnspan=3, sticky="w")
 
         status = ttk.Frame(frame)
-        status.grid(row=6, column=0, columnspan=3, sticky="we", pady=(10, 4))
+        status.grid(row=7, column=0, columnspan=3, sticky="we", pady=(10, 4))
         self.dot = tk.Canvas(status, width=16, height=16, highlightthickness=0)
         self.dot.pack(side="left")
         self.dot_item = self.dot.create_oval(2, 2, 14, 14, fill="#808080", outline="")
@@ -81,7 +95,7 @@ class RdpWindow:
         self.status_label.pack(side="left", padx=8)
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=7, column=0, columnspan=3, sticky="we", pady=(4, 0))
+        buttons.grid(row=8, column=0, columnspan=3, sticky="we", pady=(4, 0))
         self.connect_btn = ttk.Button(buttons, text="Kết nối", command=self._connect)
         self.connect_btn.pack(side="left")
         self.stop_btn = ttk.Button(buttons, text="Dừng", command=self._stop, state="disabled")
@@ -89,7 +103,7 @@ class RdpWindow:
         ttk.Button(buttons, text="Xóa máy đã lưu", command=self._forget).pack(side="right")
 
         self.log = tk.Text(frame, height=7, width=52, state="disabled", font=("Consolas", 9))
-        self.log.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
+        self.log.grid(row=9, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
 
     # --- data --------------------------------------------------------------
 
@@ -101,15 +115,31 @@ class RdpWindow:
 
     def _fill_from_saved(self):
         """Load the account saved for the current IP and nothing else - never a leftover
-        username/password typed for whatever machine was selected before this one."""
+        username/password typed for whatever machine was selected before this one.
+        The saved password is put in the field (masked unless "Hiện" is ticked)."""
         t = rdp_store.get(self.ip.get().strip())
-        self.password.set("")  # a saved password is never shown back; it's used from the store
+        self.password.set(t.password if t else "")
         if t:
             self.username.set(t.username)
             self.pw_hint.configure(text="đã lưu mật khẩu" if t.password else "chưa lưu mật khẩu")
         else:
             self.username.set("")
             self.pw_hint.configure(text="")
+        # The session count belongs to this machine only, like its account.
+        self.multi.set(bool(t and t.multi))
+        self.count.set(str(rdp_store.clamp_count(t.count if t else 1)))
+        self._sync_count_box()
+
+    def _on_multi_toggle(self):
+        if self.multi.get() and rdp_store.clamp_count(self.count.get()) < 2:
+            self.count.set("2")  # ticking multi remote with a count of 1 would change nothing
+        self._sync_count_box()
+
+    def _sync_count_box(self):
+        self.count_box.configure(state="normal" if self.multi.get() else "disabled")
+
+    def _sessions(self):
+        return rdp_store.clamp_count(self.count.get()) if self.multi.get() else 1
 
     def _forget(self):
         ip = self.ip.get().strip()
@@ -129,16 +159,23 @@ class RdpWindow:
         saved = rdp_store.get(ip)
         password = self.password.get() or (saved.password if saved else "")
         username = self.username.get().strip()
+        multi = self.multi.get()
+        count = rdp_store.clamp_count(self.count.get())
+        sessions = self._sessions()
+        if sessions > 1 and not (username and password):
+            messagebox.showerror("RDP Auto", "Multi remote cần tài khoản và mật khẩu (nhập mới hoặc đã lưu) "
+                                             "để tool tự đăng nhập từng phiên.", parent=self.root)
+            return
         if self.remember.get():
-            rdp_store.save(rdp_store.Target(ip, username, self.password.get()))
+            rdp_store.save(rdp_store.Target(ip, username, self.password.get(), multi, count))
         self._load_targets(ip)
         self.connector = rdp.RdpConnector(
-            ip, username, password,
+            ip, username, password, sessions=sessions,
             on_update=lambda s, d, a: self.events.put((s, d, a)))
         self.connector.start()
         self.connect_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self._append(f"Bắt đầu kết nối {ip}...")
+        self._append(f"Bắt đầu kết nối {ip}" + (f" ({sessions} phiên)..." if sessions > 1 else "..."))
 
     def _stop(self):
         if self.connector:

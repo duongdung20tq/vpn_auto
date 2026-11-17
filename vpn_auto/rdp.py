@@ -172,7 +172,14 @@ _ERROR_TEXT = re.compile(r"can.?t connect|cannot connect|could not|unable|not be
 
 
 def error_dialog(pid):
-    """A mstsc 'can't connect' error message box (not the security warning) owned by this mstsc."""
+    """A mstsc 'can't connect' error message box (not the security warning) owned by this mstsc.
+
+    Current Windows shows these errors as a TaskDialog ("See details" + OK): a #32770 whose text
+    is drawn by a DirectUIHWND child, so no child window carries the message and the text check
+    alone never fires (verified: only the OK button has readable text). The connecting/progress
+    box and the security warning are plain dialogs without a DirectUIHWND, so its presence marks
+    the error box. The text check stays for older builds that use classic Static controls.
+    """
     if not _HAVE_WIN32:
         return False
     for h in _tops(pid):
@@ -181,9 +188,11 @@ def error_dialog(pid):
         title = win32gui.GetWindowText(h)
         if "warning" in title.lower():
             continue
-        texts = []
-        win32gui.EnumChildWindows(h, lambda c, a: a.append(win32gui.GetWindowText(c)) or True, texts)
-        if _ERROR_TEXT.search(" ".join(texts)):
+        kids = []
+        win32gui.EnumChildWindows(h, lambda c, a: a.append(c) or True, kids)
+        if any(win32gui.GetClassName(c) == "DirectUIHWND" for c in kids):
+            return True
+        if _ERROR_TEXT.search(" ".join(win32gui.GetWindowText(c) for c in kids)):
             return True
     return False
 
@@ -210,16 +219,40 @@ def credential_prompt_present():
     return False
 
 
+class _Session:
+    """One mstsc window of a connector: its own process, attempt count and outcome."""
+
+    def __init__(self, index):
+        self.index = index
+        self.attempts = 0
+        self.proc = None
+        self.result = None  # 'connected' | 'ready' | 'wrong-cred' | 'stopped' | 'error'
+        self.error = ""
+
+
 class RdpConnector:
-    """Retry an RDP connection in a background thread until the desktop appears or stopped."""
+    """Retry an RDP connection in background threads until the desktop appears or stopped.
+
+    With sessions > 1 (multi remote) it races that many mstsc windows to the same machine - one
+    started every `stagger` seconds, each retrying on its own - to get through a lossy link
+    faster. The first window to reach the desktop wins: every other window is closed, no more are
+    started, and the state becomes "connected" with just that one session open. Every window uses
+    the same account, and the Windows Security prompt is not tied to one mstsc process, so a
+    password prompt means that account was refused: all windows stop rather than keep retrying a
+    bad password (which could lock the account). Multi remote needs a username + password so each
+    window logs in by itself.
+    """
 
     STATES = ("idle", "connecting", "connected", "ready", "stopped", "error")
 
-    def __init__(self, ip, username="", password="", *, probe_timeout=2.0, probe_interval=3.0,
-                 connect_timeout=25.0, retry_delay=3.0, poll_interval=1.0, on_update=None):
+    def __init__(self, ip, username="", password="", *, sessions=1, stagger=1.0, probe_timeout=2.0,
+                 probe_interval=3.0, connect_timeout=25.0, retry_delay=3.0, poll_interval=1.0,
+                 on_update=None):
         self.ip = ip.strip()
         self.username = username.strip()
         self.password = password
+        self.sessions = max(1, int(sessions))
+        self.stagger = stagger
         self.probe_timeout = probe_timeout
         self.probe_interval = probe_interval
         self.connect_timeout = connect_timeout
@@ -227,15 +260,21 @@ class RdpConnector:
         self.poll_interval = poll_interval
         self.on_update = on_update or (lambda state, detail, attempt: None)
         self.state = "idle"
-        self.attempts = 0
+        self.attempts = 0  # attempt number of the latest update
         self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._win_lock = threading.Lock()
         self._thread = None
-        self._proc = None
+        self._slots = []  # one _Session per window started
+        self._winner = None  # the session that reached the desktop first
 
-    def _set(self, state, detail=""):
-        self.state = state
-        log.info("RDP %s: %s %s", self.ip, state, detail)
-        self.on_update(state, detail, self.attempts)
+    def _set(self, state, detail="", attempt=None):
+        with self._lock:
+            self.state = state
+            if attempt is not None:
+                self.attempts = attempt
+            log.info("RDP %s: %s %s", self.ip, state, detail)
+            self.on_update(state, detail, self.attempts)
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -247,57 +286,112 @@ class RdpConnector:
     def stop(self, close_session=False):
         self._stop.set()
         if close_session:
-            kill(self._proc)
+            for s in list(self._slots):
+                kill(s.proc)
+
+    def _tag(self, s):
+        """'Phiên 2/3: ' in multi remote, nothing for a single session (keeps the old log text)."""
+        return f"Phiên {s.index}/{self.sessions}: " if self.sessions > 1 else ""
 
     def _run(self):
         if not self.ip:
             self._set("error", "Chưa nhập IP")
             return
-        # No TCP pre-gate: a lossy host (packet loss on 3389) drops quick probes even though
-        # mstsc connects after a few tries. So we just launch mstsc and retry, like pressing
-        # Connect repeatedly, until the desktop (or, without a password, the login prompt) shows.
-        try:
-            while not self._stop.is_set():
-                self.attempts += 1
-                self._set("connecting", f"Đang kết nối RDP (lần {self.attempts})...")
-                self._proc, rdp_path = launch(self.ip, self.username, self.password)
-                result = self._wait_connected()
-                _safe_remove(rdp_path)
-                if result == "connected":
-                    self._set("connected", f"Đã vào desktop {self.ip} sau {self.attempts} lần")
-                    return
-                if result == "ready":
-                    self._set("ready", f"Đã hiện ô nhập mật khẩu sau {self.attempts} lần - mời bạn nhập")
-                    return
-                if result == "wrong-cred":
-                    kill(self._proc)
-                    self._set("error", "Bị hỏi lại mật khẩu - kiểm tra tài khoản/mật khẩu")
-                    return
-                kill(self._proc)
-                self._proc = None
-                self._set("connecting", f"Lần {self.attempts} chưa được, thử lại...")
-                self._stop.wait(self.retry_delay)
-            self._set("stopped", "Đã dừng")
-        except Exception as exc:
-            log.exception("RDP loop failed")
-            self._set("error", str(exc))
+        if self.sessions > 1 and not (self.username and self.password):
+            self._set("error", "Multi remote cần tài khoản và mật khẩu để tự đăng nhập từng phiên")
+            return
+        workers = []
+        for index in range(1, self.sessions + 1):
+            if index > 1 and self._stop.wait(self.stagger):
+                break  # stopped (user, refused password or a window got in) before this one was due
+            s = _Session(index)
+            self._slots.append(s)
+            t = threading.Thread(target=self._worker, args=(s,), name=f"rdp-{self.ip}-{index}", daemon=True)
+            t.start()
+            workers.append(t)
+        for t in workers:
+            t.join()
+        self._finish()
 
-    def _wait_connected(self):
+    def _worker(self, s):
+        try:
+            s.result = self._open_session(s)
+        except Exception as exc:
+            log.exception("RDP session %s failed", s.index)
+            s.result, s.error = "error", str(exc)
+        if s.result in ("wrong-cred", "error"):
+            self._stop.set()  # same account in every window: retrying the others is pointless
+        elif s.result == "connected":
+            with self._win_lock:
+                won = self._winner is None
+                if won:
+                    self._winner = s
+                    self._stop.set()  # one session is in: stop and close all the others
+            if not won:  # got in at the same moment as the winner: keep only one session
+                kill(s.proc)
+                s.result = "stopped"
+
+    def _finish(self):
+        results = [s.result for s in self._slots]
+        bad = next((s for s in self._slots if s.result in ("wrong-cred", "error")), None)
+        if self._winner:
+            s = self._winner
+            if self.sessions > 1:
+                self._set("connected", f"{self._tag(s)}đã vào desktop {self.ip} sau {s.attempts} lần - "
+                                       f"đã đóng các phiên còn lại", s.attempts)
+            else:
+                self._set("connected", f"Đã vào desktop {self.ip} sau {s.attempts} lần", s.attempts)
+        elif bad and bad.result == "wrong-cred":
+            self._set("error", f"{self._tag(bad)}Bị hỏi lại mật khẩu - kiểm tra tài khoản/mật khẩu")
+        elif bad:
+            self._set("error", bad.error)
+        elif results == ["ready"]:
+            s = self._slots[0]
+            self._set("ready", f"Đã hiện ô nhập mật khẩu sau {s.attempts} lần - mời bạn nhập", s.attempts)
+        else:
+            self._set("stopped", "Đã dừng")
+
+    def _open_session(self, s):
+        """Retry one mstsc window until it ends in 'connected', 'ready', 'wrong-cred' or 'stopped'.
+
+        No TCP pre-gate: a lossy host (packet loss on 3389) drops quick probes even though
+        mstsc connects after a few tries. So we just launch mstsc and retry, like pressing
+        Connect repeatedly, until the desktop (or, without a password, the login prompt) shows.
+        """
+        while not self._stop.is_set():
+            s.attempts += 1
+            self._set("connecting", f"{self._tag(s)}Đang kết nối RDP (lần {s.attempts})...", s.attempts)
+            s.proc, rdp_path = launch(self.ip, self.username, self.password)
+            result = self._wait_connected(s.proc)
+            _safe_remove(rdp_path)
+            if result in ("connected", "ready"):
+                return result
+            kill(s.proc)
+            if result == "wrong-cred":
+                return result
+            s.proc = None
+            if self._stop.is_set():
+                break
+            self._set("connecting", f"{self._tag(s)}Lần {s.attempts} chưa được, thử lại...", s.attempts)
+            self._stop.wait(self.retry_delay)
+        return "stopped"
+
+    def _wait_connected(self, proc):
         """One mstsc launch: 'connected' (desktop), 'ready' (login prompt, no password), 'wrong-cred',
         'failed' (error/closed), or 'timeout'."""
         deadline = time.time() + self.connect_timeout
         while time.time() < deadline and not self._stop.is_set():
-            accept_security_warning(self._proc.pid)
-            if desktop_shown(self._proc.pid):
+            accept_security_warning(proc.pid)
+            if desktop_shown(proc.pid):
                 return "connected"
             if credential_prompt_present():
                 return "wrong-cred" if self.password else "ready"
-            if error_dialog(self._proc.pid):
+            if error_dialog(proc.pid):
                 return "failed"
-            if self._proc.poll() is not None:
+            if proc.poll() is not None:
                 return "failed"
             time.sleep(self.poll_interval)
-        return "connected" if desktop_shown(self._proc.pid) else "timeout"
+        return "connected" if desktop_shown(proc.pid) else "timeout"
 
 
 def _safe_remove(path):

@@ -101,13 +101,15 @@ Sau khi bật VPN, kết nối Remote Desktop tới máy đích hay rớt gói �
 
 Dùng: mở `RdpAuto.exe`, nhập **IP**, (tùy chọn) **Tài khoản** và **Mật khẩu**, bấm **Kết nối**.
 
-- Có mật khẩu → tool lưu vào Windows Credential Manager (đúng như "remember me" của mstsc) và mstsc tự đăng nhập, vào thẳng.
+- Có mật khẩu → tool đưa mật khẩu (mã hóa DPAPI) vào một file `.rdp` tạm, mstsc tự đăng nhập, vào thẳng. File tạm bị xóa ngay sau khi mở.
 - Để trống mật khẩu → tool thử lại tới khi vào được màn hình, rồi bạn tự nhập.
-- Tích **Nhớ máy này** để lần sau chỉ chọn IP là xong (mật khẩu mã hóa DPAPI). **Xóa máy đã lưu** để gỡ.
+- Tích **Nhớ máy này** để lần sau chỉ chọn IP là xong (mật khẩu mã hóa DPAPI). Chọn IP đã lưu thì tài khoản và mật khẩu của máy đó hiện sẵn; mật khẩu ẩn dạng `•••`, tích **Hiện** để xem. **Xóa máy đã lưu** để gỡ.
+- Tích **Multi remote** và chọn **Số kết nối** (1–10) để thử vào máy đó bằng nhiều cửa sổ RDP song song, giúp vào nhanh hơn khi đường truyền rớt gói. Số này **lưu riêng cho từng IP**: máy A đặt 3 thì máy B vẫn giữ cấu hình của B. Các cửa sổ bật cách nhau 1 giây, mỗi cửa sổ tự thử lại riêng. **Cửa sổ nào vào được desktop trước thì giữ lại**, tool đóng hết các cửa sổ còn lại và báo **Đã kết nối**. Multi remote cần tài khoản và mật khẩu (nhập mới hoặc đã lưu), mọi cửa sổ dùng chung tài khoản đó. Nếu bị hỏi lại mật khẩu (sai mật khẩu) thì tool dừng **tất cả** để không thử sai liên tục làm khóa tài khoản.
+- Hộp lỗi "Remote Desktop can't connect to the remote computer..." được tool tự đóng ngay khi hiện ra, rồi thử lại.
 
-Cách hoạt động: tool probe cổng 3389; khi tới được thì mở `mstsc /v:<ip>` và chờ đến khi có kết nối TCP **ESTABLISHED** tới `<ip>:3389` (tín hiệu đã vào được). Nếu lần đó thất bại (rớt bắt tay, hiện hộp lỗi, hoặc mstsc tự đóng) thì đóng cửa sổ đó và thử lại, lặp tới khi vào được. Chỉ đóng đúng cửa sổ mstsc do tool mở, không đụng phiên RDP khác của bạn.
+Cách hoạt động: tool mở `mstsc` và chờ đến khi **cửa sổ desktop từ xa** hiện ra (không chỉ dựa vào kết nối TCP 3389). Nếu lần đó thất bại (rớt bắt tay, hiện hộp lỗi, mstsc tự đóng, hoặc quá thời gian) thì đóng cửa sổ đó và thử lại, lặp tới khi vào được. Tool không probe cổng 3389 trước, vì máy rớt gói hay làm probe thất bại dù bấm Connect vài lần vẫn vào được. Chỉ đóng đúng cửa sổ mstsc do tool mở, không đụng phiên RDP khác của bạn.
 
-Dòng lệnh: `RdpAuto.exe` (mở giao diện) · `VpnAuto.exe rdp <ip>` (mở giao diện) · `VpnAuto.exe rdp --console <ip> --username <u>` (chạy trong console, đọc `RDP_PASSWORD` từ biến môi trường với `--from-env`).
+Dòng lệnh: `RdpAuto.exe` (mở giao diện) · `VpnAuto.exe rdp <ip>` (mở giao diện) · `VpnAuto.exe rdp --console <ip> --username <u>` (chạy trong console, đọc `RDP_PASSWORD` từ biến môi trường với `--from-env`; số phiên lấy theo cấu hình Multi remote đã lưu của IP đó).
 
 Đã test thật: kết nối `10.15.68.218` tự điền mật khẩu, vào trong ~1 giây; với IP chưa tới được thì báo "đang chờ" và thử lại, không mở mstsc vô ích.
 

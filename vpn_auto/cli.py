@@ -172,8 +172,9 @@ def cmd_rdp(args):
         if state in ("connected", "ready", "stopped", "error"):
             done.set()
 
-    conn = rdp.RdpConnector(ip, username, password, on_update=on_update)
-    print(f"Thử kết nối RDP tới {ip}, Ctrl+C để dừng.")
+    sessions = saved.sessions if saved else 1  # this machine's own multi-remote count
+    conn = rdp.RdpConnector(ip, username, password, sessions=sessions, on_update=on_update)
+    print(f"Thử kết nối RDP tới {ip}" + (f" ({sessions} phiên)" if sessions > 1 else "") + ", Ctrl+C để dừng.")
     conn.start()
     try:
         while not done.wait(0.5):
